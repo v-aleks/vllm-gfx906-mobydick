@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import faulthandler
 import gc
 import os
 import queue
 import signal
+import tempfile
 import threading
 import time
 from collections import defaultdict, deque
@@ -1128,6 +1130,14 @@ class EngineCoreProc(EngineCore):
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
+        # Install faulthandler as early as possible so that if the child is
+        # killed by a native signal (SIGSEGV from libamdhip64.so on gfx906
+        # ROCm 7.2.x is the motivating case) we still get a Python stack
+        # trace to disk before the process dies. The parent can then read
+        # this file via ``VLLM_ENGINECORE_FAULT_LOG`` if it survives long
+        # enough to do so.
+        _enable_enginecore_faulthandler()
+
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
         try:
@@ -2250,3 +2260,76 @@ class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):
             log_stats,
             engine_index=dp_rank,
         )
+
+
+# -----------------------------------------------------------------------------
+# Native-fault diagnostics
+# -----------------------------------------------------------------------------
+#
+# When the EngineCore child is killed by a native signal (SIGSEGV from
+# libamdhip64.so on gfx906 ROCm 7.2.x is the motivating case), the Python
+# process is gone before it can print a traceback. faulthandler is the only
+# reliable way to record where the child was when it died. We enable it as
+# early as possible inside run_engine_core, so that even if the SIGSEGV
+# happens inside torch.distributed.init_process_group() we still capture a
+# Python stack trace (and, for SIGABRT from the C runtime, the C stack too).
+#
+# The output path can be set via VLLM_ENGINECORE_FAULT_LOG; otherwise we use
+# a file inside tempfile.gettempdir() that the parent can find from the
+# child's pid. Default behaviour is to log the resolved path so operators
+# know where to look even if the parent died before reporting it.
+
+
+_FAULTHANDLER_ENABLED = False
+
+
+def _enable_enginecore_faulthandler() -> None:
+    """Install faulthandler for SIGSEGV/SIGBUS/SIGABRT/SIGFPE in this child.
+
+    Idempotent. Writes to ``VLLM_ENGINECORE_FAULT_LOG`` if set, otherwise to
+    ``<tempfile.gettempdir()>/vllm-enginecore-<pid>.faultlog``. Logs the path
+    so the parent (or a debugger) can pick it up.
+    """
+    global _FAULTHANDLER_ENABLED
+    if _FAULTHANDLER_ENABLED:
+        return
+    if faulthandler.is_enabled():
+        # Some embedders (pytest, debuggers) pre-install faulthandler; leave
+        # their config alone so we do not silently rewire stdout/stderr.
+        _FAULTHANDLER_ENABLED = True
+        return
+
+    target = os.environ.get("VLLM_ENGINECORE_FAULT_LOG")
+    if target is None:
+        target = os.path.join(
+            tempfile.gettempdir(),
+            f"vllm-enginecore-{os.getpid()}.faultlog",
+        )
+
+    try:
+        f = open(target, mode="w", buffering=1, encoding="utf-8")  # line-buffered
+    except OSError:
+        # Fall back to stderr if we cannot open the requested file.
+        faulthandler.enable(all_threads=True)
+        _FAULTHANDLER_ENABLED = True
+        return
+
+    # Register handlers for the signals that the C runtime would otherwise
+    # turn into a silent process termination. SIGSEGV is the one we actually
+    # see on gfx906; SIGBUS and SIGABRT are there for completeness.
+    for sig in (signal.SIGSEGV, signal.SIGBUS, signal.SIGABRT, signal.SIGFPE):
+        try:
+            faulthandler.register(sig, file=f, all_threads=True)
+        except (ValueError, OSError):
+            # register() refuses signals it cannot capture on this platform.
+            pass
+
+    # Also enable a generic dump-on-fatal so anything we missed still writes.
+    faulthandler.enable(file=f, all_threads=True)
+    _FAULTHANDLER_ENABLED = True
+    logger.info(
+        "EngineCore child (pid=%s) installed faulthandler; "
+        "native-fault traces will be written to %s",
+        os.getpid(),
+        target,
+    )

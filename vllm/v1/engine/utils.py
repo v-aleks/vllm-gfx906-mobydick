@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import signal
 import threading
 import weakref
 from collections.abc import Callable, Iterator
@@ -41,6 +42,61 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+
+# Hint appended to the RuntimeError raised when an EngineCore child is
+# killed by a native signal (SIGSEGV / SIGBUS / SIGABRT). We saw this on
+# gfx906 (MI50) running ROCm 7.2.x with libamdhip64.so.7.2.70201, where the
+# child would segfault during HIP bring-up and the API server would wait
+# 900 s for a Python traceback that never came. Telling the user up-front
+# what likely happened and what to try gets them unstuck in seconds.
+_NATIVE_FAULT_HINT = (
+    "If the child was killed by SIGSEGV (signal 11) or SIGABRT (signal 6) "
+    "the failure is inside the HIP runtime or another native library and "
+    "no Python traceback will be produced. Common workarounds: "
+    "--enforce-eager, HIP_LAUNCH_BLOCKING=1, VLLM_GFX906_SAFE_MODE=1, "
+    "or downgrade to a base image built against ROCm 6.3.x."
+    " Inspect `dmesg | tail -200` for a `traps:` line that points at "
+    "libamdhip64.so for the affected child PID."
+)
+
+
+def _decode_exit_code(exitcode: int | None) -> tuple[str, int]:
+    """Decode a multiprocessing Process exitcode into a (reason, code) pair.
+
+    For positive exit codes the reason is ``"exit"`` and ``code`` is the
+    raw exit code. For negative exit codes (signal-killed children),
+    the reason is the signal name (e.g. ``"SIGSEGV"``, ``"SIGABRT"``) and
+    ``code`` is the signal number.
+    """
+    if exitcode is None:
+        return ("not_finished", -1)
+    if exitcode >= 0:
+        return ("exit", exitcode)
+    sig = -exitcode
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = f"signal_{sig}"
+    return (name, sig)
+
+
+def _log_native_fault_if_present(
+    finished: dict[str, tuple[str, int]],
+) -> None:
+    """Log a one-line, high-signal summary when any child died on a signal."""
+    sig_names = {reason for reason, _ in finished.values()}
+    if not sig_names:
+        return
+    for name in sorted(sig_names):
+        if name in ("exit", "not_finished"):
+            continue
+        logger.error(
+            "EngineCore child terminated by native signal %s. "
+            "This usually indicates a fault inside a native library "
+            "(e.g. libamdhip64.so on gfx906 ROCm 7.2.x). "
+            "No Python traceback will be produced.",
+            name,
+        )
 
 
 class CoreEngineState(Enum):
@@ -234,6 +290,16 @@ class CoreEngineProcManager:
                 exitcode = proc.exitcode
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
+                    reason, code = _decode_exit_code(exitcode)
+                    if reason != "exit":
+                        logger.error(
+                            "EngineCore proc %s (pid=%s) terminated by "
+                            "native signal %s (code %d).",
+                            proc.name,
+                            proc.pid,
+                            reason,
+                            code,
+                        )
             if died_sentinels:
                 # Any engine exit currently triggers a shutdown. Future
                 # work (e.g., Elastic and fault-tolerant EP) will add finer-grained
@@ -252,6 +318,37 @@ class CoreEngineProcManager:
             for proc in self.processes
             if proc.exitcode is not None
         }
+
+    def finished_procs_with_reasons(self) -> dict[str, tuple[str, int]]:
+        """Returns dict of proc name -> (reason, code) for any finished procs.
+
+        ``reason`` is one of ``"exit"`` (clean exit with positive/zero code)
+        or ``"SIGSEGV"``, ``"SIGABRT"``, etc. for native signals — which is
+        what we get when a child is killed by the kernel (e.g. the
+        ``libamdhip64.so`` SIGSEGV on gfx906 ROCm 7.2.x). Decoding the signal
+        is what lets ``wait_for_engine_startup`` report "child killed by
+        SIGSEGV" instead of just "exit code -11".
+
+        ``code`` is the raw exit code (positive for normal exits, negative
+        signal number for signal-killed exits).
+        """
+        import signal as _signal
+
+        out: dict[str, tuple[str, int]] = {}
+        for proc in self.processes:
+            if proc.exitcode is None:
+                continue
+            code = proc.exitcode
+            if code >= 0:
+                out[proc.name] = ("exit", code)
+                continue
+            sig = -code
+            try:
+                name = _signal.Signals(sig).name
+            except ValueError:
+                name = f"signal_{sig}"
+            out[proc.name] = (name, sig)
+        return out
 
 
 class SignalCallback:
@@ -1243,13 +1340,19 @@ def wait_for_engine_startup(
             continue
         if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
-            finished = proc_manager.finished_procs() if proc_manager else {}
-            if coord_process is not None and coord_process.exitcode is not None:
-                finished[coord_process.name] = coord_process.exitcode
+            finished = proc_manager.finished_procs_with_reasons() if proc_manager else {}
+            if (
+                coord_process is not None
+                and coord_process.exitcode is not None
+            ):
+                finished[coord_process.name] = _decode_exit_code(
+                    coord_process.exitcode
+                )
+            _log_native_fault_if_present(finished)
             raise RuntimeError(
                 "Engine core initialization failed. "
                 "See root cause above. "
-                f"Failed core proc(s): {finished}"
+                f"Failed core proc(s): {finished}. {_NATIVE_FAULT_HINT}"
             )
 
         # Receive HELLO and READY messages from the input socket.

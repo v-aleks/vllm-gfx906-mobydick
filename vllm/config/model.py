@@ -1071,12 +1071,40 @@ class ModelConfig:
     def _verify_cuda_graph(self) -> None:
         # CUDAGraph capture not supported for encoder-decoder models on ROCm
         unsupported_rocm = self.is_encoder_decoder
-        if unsupported_rocm and not self.enforce_eager and current_platform.is_rocm():
-            logger.warning(
-                "CUDA graph is not supported for %s on ROCm yet, fallback "
-                "to eager mode.",
-                self.model_arch_config.model_type,
-            )
+        # gfx906 (MI50 / Radeon VII) ROCm 7.2.x: CUDA graph capture has been
+        # observed to trigger a SIGSEGV inside libamdhip64.so during the
+        # capture stream setup. Force eager mode for any model on gfx906 to
+        # avoid the graph_capture() code path. Users who know their model and
+        # driver combination is fine can override with --enforce-eager=false
+        # explicitly... wait, that's the wrong direction: they can only opt
+        # *in* to eager here, not out. To opt out, build with
+        # VLLM_GFX906_FORCE_EAGER=0. See vllm.platforms.rocm for details.
+        try:
+            from vllm.platforms.rocm import on_gfx906
+
+            is_gfx906 = on_gfx906()
+        except Exception:
+            is_gfx906 = False
+        gfx906_force_eager = is_gfx906 and envs.VLLM_GFX906_FORCE_EAGER
+
+        if (
+            (unsupported_rocm or gfx906_force_eager)
+            and not self.enforce_eager
+            and current_platform.is_rocm()
+        ):
+            if gfx906_force_eager and not unsupported_rocm:
+                logger.warning(
+                    "Forcing enforce_eager=True on gfx906 (ROCm 7.2.x) to "
+                    "avoid the libamdhip64.so SIGSEGV observed during "
+                    "CUDAGraph capture. Set VLLM_GFX906_FORCE_EAGER=0 to "
+                    "opt out if your driver is known good."
+                )
+            else:
+                logger.warning(
+                    "CUDA graph is not supported for %s on ROCm yet, "
+                    "fallback to eager mode.",
+                    self.model_arch_config.model_type,
+                )
             self.enforce_eager = True
 
     def _verify_bnb_config(self) -> None:

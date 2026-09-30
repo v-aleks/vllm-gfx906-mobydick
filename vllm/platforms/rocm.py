@@ -331,14 +331,93 @@ def on_gfx950() -> bool:
     return _ON_GFX950
 
 
+def _resolve_gfx906_safe_mode() -> bool:
+    """Resolve VLLM_GFX906_SAFE_MODE into a bool.
+
+    Values:
+      - "auto": True if on_gfx906() is True.
+      - "1" / "true": always True.
+      - "0" / "false": always False.
+
+    Anything else is treated as "auto".
+    """
+    raw = envs.VLLM_GFX906_SAFE_MODE
+    if isinstance(raw, bool):
+        return raw
+    val = str(raw).strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    # "auto" or anything else: opt-in only on gfx906.
+    return on_gfx906()
+
+
+_GFX906_SAFE_MODE_KEYS: dict[str, str] = {
+    # NCCL: avoid captured-event queries from watchdog threads; force
+    # synchronous error handling so SIGSEGV surfaces immediately.
+    "TORCH_NCCL_BLOCKING_WAIT": "1",
+    "TORCH_NCCL_ENABLE_MONITORING": "0",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
+    "NCCL_ASYNC_ERROR_HANDLING": "0",
+    # NCCL transport: the gfx906 fork's NCCL/RCCL build has been observed to
+    # deadlock on P2P/GDR paths inside libnccl.so when init_process_group
+    # races with HIP stream creation.
+    "NCCL_P2P_DISABLE": "1",
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_NET_GDR_LEVEL": "0",
+    "NCCL_SOCKET_IFNAME": "lo",
+    # AITER: some gfx906 builds link against AITER .so files that import
+    # libamdhip64 symbols at import time and trigger the offending SIGSEGV.
+    "VLLM_ROCM_USE_AITER": "0",
+    "VLLM_ROCM_USE_AITER_LINEAR": "0",
+    # Force the Triton-based flash attention path (gfx906 only path).
+    "VLLM_USE_TRITON_FLASH_ATTN": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+    # Force workers to spawn rather than fork. Forking after HIP is
+    # initialized can corrupt HIP context state on gfx906.
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    # Serialise kernel launches so a SIGSEGV points at the first
+    # responsible kernel, not whichever one happened to be in flight.
+    "HIP_LAUNCH_BLOCKING": "1",
+}
+
+
 def _set_gfx906_nccl_workarounds() -> None:
-    """Avoid captured-event queries from NCCL watchdog threads on gfx906."""
+    """Apply gfx906 HIP-runtime / NCCL / aiter / flash-attn workarounds.
+
+    Two modes:
+      - "minimal" (default when VLLM_GFX906_SAFE_MODE is "0"/"false" or unset
+        and on non-gfx906 hardware): only the four NCCL watchdog env vars
+        that were already being set on gfx906 before the safe-mode switch
+        existed. These are the variables known to suppress the spurious
+        captured-event query warnings on gfx906.
+
+      - "safe" (when VLLM_GFX906_SAFE_MODE resolves to True, including
+        "auto" on gfx906): apply the full set in `_GFX906_SAFE_MODE_KEYS`.
+        This is a superset intended to avoid the libamdhip64.so SIGSEGV
+        reported on ROCm 7.2.x with the gfx906 fork.
+    """
     if not on_gfx906():
         return
-    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
-    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+    for k, v in {
+        "TORCH_NCCL_BLOCKING_WAIT": "1",
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
+        "NCCL_ASYNC_ERROR_HANDLING": "0",
+    }.items():
+        os.environ.setdefault(k, v)
+    if not _resolve_gfx906_safe_mode():
+        return
+    for k, v in _GFX906_SAFE_MODE_KEYS.items():
+        os.environ.setdefault(k, v)
+    logger.warning_once(
+        "VLLM_GFX906_SAFE_MODE active: applying consolidated gfx906 "
+        "workarounds (NCCL watchdog off, P2P/GDR/IB off, AITER off, "
+        "spawn workers, HIP_LAUNCH_BLOCKING=1). This may slow things down "
+        "but should avoid the libamdhip64.so SIGSEGV observed on "
+        "ROCm 7.2.x with the gfx906 fork."
+    )
 
 
 _set_gfx906_nccl_workarounds()

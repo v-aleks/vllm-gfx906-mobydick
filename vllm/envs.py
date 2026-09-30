@@ -149,6 +149,36 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
+    VLLM_GFX906_SAFE_MODE: str = "auto"
+    """Consolidated gfx906 HIP-runtime / NCCL / flash-attn / aiter workarounds
+    to avoid the libamdhip64.so SIGSEGV observed on ROCm 7.2.x with the gfx906
+    fork (e.g. aiinfos/vllm-gfx906-mobydick). Values:
+      - "auto" (default): apply on gfx906.
+      - "1" / "true": always apply, regardless of detected GPU.
+      - "0" / "false": never apply.
+
+    When active, this sets: TORCH_NCCL_BLOCKING_WAIT=1,
+    TORCH_NCCL_ENABLE_MONITORING=0, TORCH_NCCL_ASYNC_ERROR_HANDLING=0,
+    NCCL_ASYNC_ERROR_HANDLING=0, NCCL_P2P_DISABLE=1, NCCL_IB_DISABLE=1,
+    NCCL_NET_GDR_LEVEL=0, NCCL_SOCKET_IFNAME=lo, VLLM_ROCM_USE_AITER=0,
+    VLLM_ROCM_USE_AITER_LINEAR=0, VLLM_USE_TRITON_FLASH_ATTN=1,
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE,
+    VLLM_WORKER_MULTIPROC_METHOD=spawn, HIP_LAUNCH_BLOCKING=1.
+    See vllm.platforms.rocm._set_gfx906_nccl_workarounds for the actual code.
+    """
+    VLLM_ENGINECORE_FAULT_LOG: str | None = None
+    """Path for the faulthandler dump file installed by the EngineCore child
+    process. Defaults to ``<tempfile.gettempdir()>/vllm-enginecore-<pid>.faultlog``
+    when unset. Set to a custom path if you want the dump to live in a
+    specific directory that survives container restarts.
+    """
+    VLLM_GFX906_FORCE_EAGER: bool = True
+    """When True (the default) and the host GPU is gfx906, ModelConfig will
+    auto-pin ``enforce_eager=True`` for every model. This avoids the
+    CUDAGraph capture path that has been observed to trigger a SIGSEGV
+    inside libamdhip64.so on gfx906 ROCm 7.2.x. Set to 0 to opt out if
+    your specific gfx906 / driver combination is known good.
+    """
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1262,6 +1292,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # Consolidated gfx906 workarounds. "auto" applies on gfx906 only;
+    # "1"/"0" force the corresponding state regardless of detected GPU.
+    "VLLM_GFX906_SAFE_MODE": lambda: os.getenv("VLLM_GFX906_SAFE_MODE", "auto"),
+    # Path for faulthandler output from the EngineCore child. Useful when
+    # the child is killed by a native signal (e.g. SIGSEGV from
+    # libamdhip64.so on gfx906 ROCm 7.2.x) and the parent never gets to
+    # log the traceback itself.
+    "VLLM_ENGINECORE_FAULT_LOG": lambda: os.getenv("VLLM_ENGINECORE_FAULT_LOG"),
+    # Force ModelConfig.enforce_eager=True on gfx906. See the type stub
+    # docstring for the full rationale.
+    "VLLM_GFX906_FORCE_EAGER": lambda: bool(
+        int(os.getenv("VLLM_GFX906_FORCE_EAGER", "1"))
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE

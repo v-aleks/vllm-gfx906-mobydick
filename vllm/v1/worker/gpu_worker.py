@@ -320,7 +320,9 @@ class Worker(WorkerBase):
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # Initialize workspace manager. The WorkspaceManager itself does
+        # not allocate GPU memory eagerly — the underlying tensor is
+        # allocated lazily on the first `get_simultaneous()` call.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 

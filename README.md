@@ -19,6 +19,71 @@ Once inside the container, you are all set! You can immediately start serving mo
 
 ---
 
+### ⚠️ Known issues on gfx906 (MI50 / Radeon VII) with ROCm 7.2.x
+
+If you are running on gfx906 hardware with the mobydick image built against
+`mixa3607/pytorch-gfx906:vX.Y.Z-rocm-7.2.1` (the current `latest` tag), there
+is a known reproducible SIGSEGV inside `libamdhip64.so.7.2.70201` that can
+crash the `EngineCore` subprocess during start-up, and a rarer but more
+dangerous kernel-state deadlock that can take the entire host down. Both
+faults are inside the AMD HIP runtime, not in vLLM, and they are tracked in
+[the upstream issue tracker](https://github.com/ai-infos/vllm-gfx906-mobydick/issues).
+
+#### What we do for you out of the box
+
+This fork applies the following workarounds automatically when `on_gfx906()`
+is detected at import time:
+
+- `enforce_eager=True` is forced for every model (`VLLM_GFX906_FORCE_EAGER=1`
+  by default). This avoids the CUDAGraph capture path that has been observed
+  to trigger the SIGSEGV.
+- `VLLM_GFX906_SAFE_MODE=auto` (the default) applies a consolidated set of
+  workarounds: NCCL watchdog off, NCCL P2P/GDR/IB off, AITER off,
+  `VLLM_WORKER_MULTIPROC_METHOD=spawn`, `HIP_LAUNCH_BLOCKING=1`,
+  `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`.
+- The EngineCore child process installs a `faulthandler` dump
+  (path controllable via `VLLM_ENGINECORE_FAULT_LOG`) so a native SIGSEGV
+  produces a Python stack trace on disk before the process dies.
+- `wait_for_engine_startup` decodes negative child exit codes as their
+  `signal.Signals` name and surfaces "EngineCore terminated by SIGSEGV"
+  instead of a generic "Engine core initialization failed." You get the
+  diagnostic in seconds, not after the 900 s timeout fires.
+
+If you want to turn any of these off (e.g. you know your specific gfx906
+build of `libamdhip64.so` is patched), set the corresponding env var to `0`:
+
+```bash
+export VLLM_GFX906_SAFE_MODE=0       # disable the full safe-mode set
+export VLLM_GFX906_FORCE_EAGER=0     # do not force enforce_eager on gfx906
+```
+
+#### Workarounds if the auto-applied set is not enough
+
+If you still hit the SIGSEGV after the safe-mode set is on, the next things
+to try in order:
+
+1. `HIP_LAUNCH_BLOCKING=1` (already on by default with safe mode).
+2. `--enforce-eager` (already on by default on gfx906).
+3. Pin `NCCL_DEBUG=INFO` and inspect `dmesg` for the exact offset inside
+   `libamdhip64.so`; if it has shifted, file an issue with the new offset.
+4. Fall back to a mobydick image built on ROCm 6.3.x:
+   ```bash
+   # The older v0.20.1rc0.x tag was built against ROCm 6.3.3 (per
+   # build_and_push_docker.sh) and is not affected by the 7.2.x SIGSEGV.
+   docker pull aiinfos/vllm-gfx906-mobydick:v0.20.1rc0.x-rocm7.2.1-pytorch2.11.0
+   ```
+5. File an issue at
+   <https://github.com/ai-infos/vllm-gfx906-mobydick/issues> with
+   `dmesg | grep -E 'traps.*EngineCor|libamdhip64'` output and the first
+   200 lines of the vLLM log after `EngineCore pid=`.
+
+The host-deadlock symptom (ssh stops responding, GPU[0] util pinned at 100 %
+even though our process was on GPU[2]) cannot be fixed in vLLM; it is an
+amdgpu-driver bug and must be reported to AMD with the `dmesg` output from
+the moment the host became unresponsive.
+
+---
+
 ### 🛠️ Manual Build from Source
 
 If you prefer to build and install from source on your bare metal instead, follow the steps below:
